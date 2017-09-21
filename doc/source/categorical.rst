@@ -1034,3 +1034,4 @@ Use ``copy=True`` to prevent such a behaviour or simply don't reuse `Categorical
     This also happens in some cases when you supply a `numpy` array instead of a `Categorical`:
     using an int array (e.g. ``np.array([1,2,3,4])``) will exhibit the same behaviour, while using
     a string array (e.g. ``np.array(["a","b","c","a"])``) will not.
+
