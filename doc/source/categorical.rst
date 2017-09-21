@@ -3,7 +3,7 @@
 .. currentmodule:: pandas
 
 .. ipython:: python
-   :suppress:
+   :suppress:
 
    import numpy as np
    import pandas as pd
@@ -144,9 +144,10 @@ Using ``.describe()`` on categorical data will produce similar output to a `Seri
     cat = pd.Categorical(["a", "c", "c", np.nan], categories=["b", "a", "c"])
     df = pd.DataFrame({"cat":cat, "s":["a", "c", "c", np.nan]})
     df.describe()
-    df["cat"].describe()
+    df["cat"].describe()
 
 .. _categorical.cat:
+
 Working with categories
 -----------------------
 
@@ -1033,3 +1034,4 @@ Use ``copy=True`` to prevent such a behaviour or simply don't reuse `Categorical
     This also happens in some cases when you supply a `numpy` array instead of a `Categorical`:
     using an int array (e.g. ``np.array([1,2,3,4])``) will exhibit the same behaviour, while using
     a string array (e.g. ``np.array(["a","b","c","a"])``) will not.
+

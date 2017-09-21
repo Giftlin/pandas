@@ -1085,7 +1085,7 @@ def wide_to_long(df, stubnames, i, j, sep="", suffix='\d+'):
 
 
 def get_dummies(data, prefix=None, prefix_sep='_', dummy_na=False,
-                columns=None, sparse=False, drop_first=False):
+                columns=None, sparse=False, drop_first=False, reindex=True):
     """
     Convert categorical variable into dummy/indicator variables
 
@@ -1110,11 +1110,12 @@ def get_dummies(data, prefix=None, prefix_sep='_', dummy_na=False,
         Whether the dummy columns should be sparse or not.  Returns
         SparseDataFrame if `data` is a Series or if all columns are included.
         Otherwise returns a DataFrame with some SparseBlocks.
-
-        .. versionadded:: 0.16.1
     drop_first : bool, default False
         Whether to get k-1 dummies out of k categorical levels by removing the
         first level.
+    reindex : bool, default True
+        Whether to append the new dummy columns to the end of the DataFrame.
+        Or to place at the actual position of the original column.
 
         .. versionadded:: 0.18.0
     Returns
@@ -1225,7 +1226,10 @@ def get_dummies(data, prefix=None, prefix_sep='_', dummy_na=False,
             dummy = _get_dummies_1d(data[col], prefix=pre, prefix_sep=sep,
                                     dummy_na=dummy_na, sparse=sparse,
                                     drop_first=drop_first)
-            with_dummies.append(dummy)
+            if reindex:
+                with_dummies.append(dummy)
+            else:
+                with_dummies.insert(list(data.columns).index(col), dummy)
         result = concat(with_dummies, axis=1)
     else:
         result = _get_dummies_1d(data, prefix, prefix_sep, dummy_na,
@@ -1350,3 +1354,4 @@ def make_axis_dummies(frame, axis='minor', transform=None):
     values = values.take(labels, axis=0)
 
     return DataFrame(values, columns=items, index=frame.index)
+

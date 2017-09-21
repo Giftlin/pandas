@@ -21,8 +21,7 @@ from cpython cimport (
     PyObject_RichCompare,
     Py_GT, Py_GE, Py_EQ, Py_NE, Py_LT, Py_LE,
     PyUnicode_Check,
-    PyUnicode_AsUTF8String,
-)
+    PyUnicode_AsUTF8String)
 
 cdef extern from "Python.h":
     cdef PyTypeObject *Py_TYPE(object)
@@ -73,19 +72,12 @@ import re
 
 # dateutil compat
 from dateutil.tz import (tzoffset, tzlocal as _dateutil_tzlocal,
-                         tzfile as _dateutil_tzfile,
                          tzutc as _dateutil_tzutc,
                          tzstr as _dateutil_tzstr)
 
-from pandas.compat import is_platform_windows
-if is_platform_windows():
-    from dateutil.zoneinfo import gettz as _dateutil_gettz
-else:
-    from dateutil.tz import gettz as _dateutil_gettz
 from dateutil.relativedelta import relativedelta
 from dateutil.parser import DEFAULTPARSER
 
-from pytz.tzinfo import BaseTzInfo as _pytz_BaseTzInfo
 from pandas.compat import (parse_date, string_types, iteritems,
                            StringIO, callable)
 
@@ -108,11 +100,17 @@ iNaT = NPY_NAT
 
 
 from tslibs.timezones cimport (
-    _is_utc, _is_tzlocal,
-    _treat_tz_as_dateutil, _treat_tz_as_pytz,
-    _get_zone,
-    _get_utcoffset)
-from tslibs.timezones import get_timezone, _get_utcoffset  # noqa
+    is_utc, is_tzlocal, _is_fixed_offset,
+    treat_tz_as_dateutil, treat_tz_as_pytz,
+    get_timezone, get_utcoffset, maybe_get_tz,
+    _get_dst_info
+    )
+from tslibs.timezones import (  # noqa
+    get_timezone, get_utcoffset, maybe_get_tz,
+    _p_tz_cache_key, dst_cache,
+    _unbox_utcoffsets,
+    _dateutil_gettz
+    )
 
 
 cdef inline object create_timestamp_from_ts(
@@ -144,6 +142,7 @@ def ints_to_pydatetime(ndarray[int64_t] arr, tz=None, freq=None, box=False):
 
     cdef:
         Py_ssize_t i, n = len(arr)
+        ndarray[int64_t] trans, deltas
         pandas_datetimestruct dts
         object dt
         int64_t value
@@ -160,7 +159,7 @@ def ints_to_pydatetime(ndarray[int64_t] arr, tz=None, freq=None, box=False):
         func_create = create_datetime_from_ts
 
     if tz is not None:
-        if _is_utc(tz):
+        if is_utc(tz):
             for i in range(n):
                 value = arr[i]
                 if value == NPY_NAT:
@@ -169,7 +168,7 @@ def ints_to_pydatetime(ndarray[int64_t] arr, tz=None, freq=None, box=False):
                     pandas_datetime_to_datetimestruct(
                         value, PANDAS_FR_ns, &dts)
                     result[i] = func_create(value, dts, tz, freq)
-        elif _is_tzlocal(tz) or _is_fixed_offset(tz):
+        elif is_tzlocal(tz) or _is_fixed_offset(tz):
             for i in range(n):
                 value = arr[i]
                 if value == NPY_NAT:
@@ -194,7 +193,7 @@ def ints_to_pydatetime(ndarray[int64_t] arr, tz=None, freq=None, box=False):
 
                     # Adjust datetime64 timestamp, recompute datetimestruct
                     pos = trans.searchsorted(value, side='right') - 1
-                    if _treat_tz_as_pytz(tz):
+                    if treat_tz_as_pytz(tz):
                         # find right representation of dst etc in pytz timezone
                         new_tz = tz._tzinfos[tz._transition_info[pos]]
                     else:
@@ -240,20 +239,6 @@ def ints_to_pytimedelta(ndarray[int64_t] arr, box=False):
 
     return result
 
-
-cdef inline bint _is_fixed_offset(object tz):
-    if _treat_tz_as_dateutil(tz):
-        if len(tz._trans_idx) == 0 and len(tz._trans_list) == 0:
-            return 1
-        else:
-            return 0
-    elif _treat_tz_as_pytz(tz):
-        if (len(tz._transition_info) == 0
-            and len(tz._utc_transition_times) == 0):
-            return 1
-        else:
-            return 0
-    return 1
 
 _zero_time = datetime_time(0, 0)
 _no_input = object()
@@ -433,8 +418,9 @@ class Timestamp(_Timestamp):
 
     def _round(self, freq, rounder):
 
-        cdef int64_t unit
-        cdef object result, value
+        cdef:
+            int64_t unit, r, value,  buff = 1000000
+            object result
 
         from pandas.tseries.frequencies import to_offset
         unit = to_offset(freq).nanos
@@ -445,16 +431,15 @@ class Timestamp(_Timestamp):
         if unit < 1000 and unit % 1000 != 0:
             # for nano rounding, work with the last 6 digits separately
             # due to float precision
-            buff = 1000000
-            result = (buff * (value // buff) + unit *
-                      (rounder((value % buff) / float(unit))).astype('i8'))
+            r = (buff * (value // buff) + unit *
+                 (rounder((value % buff) / float(unit))).astype('i8'))
         elif unit >= 1000 and unit % 1000 != 0:
             msg = 'Precision will be lost using frequency: {}'
             warnings.warn(msg.format(freq))
-            result = (unit * rounder(value / float(unit)).astype('i8'))
+            r = (unit * rounder(value / float(unit)).astype('i8'))
         else:
-            result = (unit * rounder(value / float(unit)).astype('i8'))
-        result = Timestamp(result, unit='ns')
+            r = (unit * rounder(value / float(unit)).astype('i8'))
+        result = Timestamp(r, unit='ns')
         if self.tz is not None:
             result = result.tz_localize(self.tz)
         return result
@@ -699,14 +684,16 @@ class Timestamp(_Timestamp):
 
         cdef:
             pandas_datetimestruct dts
-            int64_t value
+            int64_t value, value_tz, offset
             object _tzinfo, result, k, v
+            datetime ts_input
 
         # set to naive if needed
         _tzinfo = self.tzinfo
         value = self.value
         if _tzinfo is not None:
-            value = tz_convert_single(value, 'UTC', _tzinfo)
+            value_tz = tz_convert_single(value, _tzinfo, 'UTC')
+            value += value - value_tz
 
         # setup components
         pandas_datetime_to_datetimestruct(value, PANDAS_FR_ns, &dts)
@@ -740,16 +727,14 @@ class Timestamp(_Timestamp):
             _tzinfo = tzinfo
 
         # reconstruct & check bounds
-        value = pandas_datetimestruct_to_datetime(PANDAS_FR_ns, &dts)
+        ts_input = datetime(dts.year, dts.month, dts.day, dts.hour, dts.min,
+                            dts.sec, dts.us, tzinfo=_tzinfo)
+        ts = convert_to_tsobject(ts_input, _tzinfo, None, 0, 0)
+        value = ts.value + (dts.ps // 1000)
         if value != NPY_NAT:
             _check_dts_bounds(&dts)
 
-        # set tz if needed
-        if _tzinfo is not None:
-            value = tz_convert_single(value, _tzinfo, 'UTC')
-
-        result = create_timestamp_from_ts(value, dts, _tzinfo, self.freq)
-        return result
+        return create_timestamp_from_ts(value, dts, _tzinfo, self.freq)
 
     def isoformat(self, sep='T'):
         base = super(_Timestamp, self).isoformat(sep=sep)
@@ -1107,12 +1092,12 @@ cdef class _Timestamp(datetime):
         try:
             stamp += self.strftime('%z')
             if self.tzinfo:
-                zone = _get_zone(self.tzinfo)
+                zone = get_timezone(self.tzinfo)
         except ValueError:
             year2000 = self.replace(year=2000)
             stamp += year2000.strftime('%z')
             if self.tzinfo:
-                zone = _get_zone(self.tzinfo)
+                zone = get_timezone(self.tzinfo)
 
         try:
             stamp += zone.strftime(' %%Z')
@@ -1191,7 +1176,7 @@ cdef class _Timestamp(datetime):
         return np.datetime64(self.value, 'ns')
 
     def __add__(self, other):
-        cdef int64_t other_int
+        cdef int64_t other_int, nanos
 
         if is_timedelta64_object(other):
             other_int = other.astype('timedelta64[ns]').view('i8')
@@ -1272,7 +1257,7 @@ cdef class _Timestamp(datetime):
         cdef:
             int64_t val
         val = self.value
-        if self.tz is not None and not _is_utc(self.tz):
+        if self.tz is not None and not is_utc(self.tz):
             val = tz_convert_single(self.value, 'UTC', self.tz)
         return val
 
@@ -1510,14 +1495,14 @@ cdef convert_to_tsobject(object ts, object tz, object unit,
                     except:
                         pass
                     obj.value = _pydatetime_to_dts(ts, &obj.dts)
-                    ts_offset = _get_utcoffset(ts.tzinfo, ts)
+                    ts_offset = get_utcoffset(ts.tzinfo, ts)
                     obj.value -= _delta_to_nanoseconds(ts_offset)
-                    tz_offset = _get_utcoffset(tz, ts)
+                    tz_offset = get_utcoffset(tz, ts)
                     obj.value += _delta_to_nanoseconds(tz_offset)
                     pandas_datetime_to_datetimestruct(obj.value,
                                                       PANDAS_FR_ns, &obj.dts)
                     obj.tzinfo = tz
-            elif not _is_utc(tz):
+            elif not is_utc(tz):
                 ts = _localize_pydatetime(ts, tz)
                 obj.value = _pydatetime_to_dts(ts, &obj.dts)
                 obj.tzinfo = ts.tzinfo
@@ -1529,8 +1514,8 @@ cdef convert_to_tsobject(object ts, object tz, object unit,
             obj.value = _pydatetime_to_dts(ts, &obj.dts)
             obj.tzinfo = ts.tzinfo
 
-        if obj.tzinfo is not None and not _is_utc(obj.tzinfo):
-            offset = _get_utcoffset(obj.tzinfo, ts)
+        if obj.tzinfo is not None and not is_utc(obj.tzinfo):
+            offset = get_utcoffset(obj.tzinfo, ts)
             obj.value -= _delta_to_nanoseconds(offset)
 
         if is_timestamp(ts):
@@ -1641,13 +1626,17 @@ cdef inline void _localize_tso(_TSObject obj, object tz):
     """
     Take a TSObject in UTC and localizes to timezone tz.
     """
-    if _is_utc(tz):
+    cdef:
+        ndarray[int64_t] trans, deltas
+        Py_ssize_t delta, posn
+
+    if is_utc(tz):
         obj.tzinfo = tz
-    elif _is_tzlocal(tz):
+    elif is_tzlocal(tz):
         pandas_datetime_to_datetimestruct(obj.value, PANDAS_FR_ns, &obj.dts)
         dt = datetime(obj.dts.year, obj.dts.month, obj.dts.day, obj.dts.hour,
                       obj.dts.min, obj.dts.sec, obj.dts.us, tz)
-        delta = int(_get_utcoffset(tz, dt).total_seconds()) * 1000000000
+        delta = int(get_utcoffset(tz, dt).total_seconds()) * 1000000000
         if obj.value != NPY_NAT:
             pandas_datetime_to_datetimestruct(obj.value + delta,
                                               PANDAS_FR_ns, &obj.dts)
@@ -1671,7 +1660,7 @@ cdef inline void _localize_tso(_TSObject obj, object tz):
                 pandas_datetime_to_datetimestruct(
                     obj.value, PANDAS_FR_ns, &obj.dts)
             obj.tzinfo = tz
-        elif _treat_tz_as_pytz(tz):
+        elif treat_tz_as_pytz(tz):
             inf = tz._transition_info[pos]
             if obj.value != NPY_NAT:
                 pandas_datetime_to_datetimestruct(obj.value + deltas[pos],
@@ -1680,7 +1669,7 @@ cdef inline void _localize_tso(_TSObject obj, object tz):
                 pandas_datetime_to_datetimestruct(obj.value,
                                                   PANDAS_FR_ns, &obj.dts)
             obj.tzinfo = tz._tzinfos[inf]
-        elif _treat_tz_as_dateutil(tz):
+        elif treat_tz_as_dateutil(tz):
             if obj.value != NPY_NAT:
                 pandas_datetime_to_datetimestruct(obj.value + deltas[pos],
                                                   PANDAS_FR_ns, &obj.dts)
@@ -1692,7 +1681,7 @@ cdef inline void _localize_tso(_TSObject obj, object tz):
             obj.tzinfo = tz
 
 
-def _localize_pydatetime(object dt, object tz):
+cpdef inline object _localize_pydatetime(object dt, object tz):
     """
     Take a datetime/Timestamp in UTC and localizes to timezone tz.
     """
@@ -1707,27 +1696,6 @@ def _localize_pydatetime(object dt, object tz):
         return tz.localize(dt)
     except AttributeError:
         return dt.replace(tzinfo=tz)
-
-
-cpdef inline object maybe_get_tz(object tz):
-    """
-    (Maybe) Construct a timezone object from a string. If tz is a string, use
-    it to construct a timezone object. Otherwise, just return tz.
-    """
-    if isinstance(tz, string_types):
-        if tz == 'tzlocal()':
-            tz = _dateutil_tzlocal()
-        elif tz.startswith('dateutil/'):
-            zone = tz[9:]
-            tz = _dateutil_gettz(zone)
-            # On Python 3 on Windows, the filename is not always set correctly.
-            if isinstance(tz, _dateutil_tzfile) and '.tar.gz' in tz._filename:
-                tz._filename = zone
-        else:
-            tz = pytz.timezone(tz)
-    elif is_integer_object(tz):
-        tz = pytz.FixedOffset(tz / 60)
-    return tz
 
 
 class OutOfBoundsDatetime(ValueError):
@@ -1770,10 +1738,10 @@ def datetime_to_datetime64(ndarray[object] values):
         elif PyDateTime_Check(val):
             if val.tzinfo is not None:
                 if inferred_tz is not None:
-                    if _get_zone(val.tzinfo) != inferred_tz:
+                    if get_timezone(val.tzinfo) != inferred_tz:
                         raise ValueError('Array must be all same time zone')
                 else:
-                    inferred_tz = _get_zone(val.tzinfo)
+                    inferred_tz = get_timezone(val.tzinfo)
 
                 _ts = convert_to_tsobject(val, None, None, 0, 0)
                 iresult[i] = _ts.value
@@ -3929,7 +3897,7 @@ for _maybe_method_name in dir(NaTType):
 # Conversion routines
 
 
-def _delta_to_nanoseconds(delta):
+cpdef int64_t _delta_to_nanoseconds(delta):
     if isinstance(delta, np.ndarray):
         return delta.astype('m8[ns]').astype('int64')
     if hasattr(delta, 'nanos'):
@@ -4088,9 +4056,9 @@ def tz_convert(ndarray[int64_t] vals, object tz1, object tz2):
         return np.array([], dtype=np.int64)
 
     # Convert to UTC
-    if _get_zone(tz1) != 'UTC':
+    if get_timezone(tz1) != 'UTC':
         utc_dates = np.empty(n, dtype=np.int64)
-        if _is_tzlocal(tz1):
+        if is_tzlocal(tz1):
             for i in range(n):
                 v = vals[i]
                 if v == NPY_NAT:
@@ -4099,7 +4067,7 @@ def tz_convert(ndarray[int64_t] vals, object tz1, object tz2):
                     pandas_datetime_to_datetimestruct(v, PANDAS_FR_ns, &dts)
                     dt = datetime(dts.year, dts.month, dts.day, dts.hour,
                                   dts.min, dts.sec, dts.us, tz1)
-                    delta = (int(_get_utcoffset(tz1, dt).total_seconds())
+                    delta = (int(get_utcoffset(tz1, dt).total_seconds())
                              * 1000000000)
                     utc_dates[i] = v - delta
         else:
@@ -4126,11 +4094,11 @@ def tz_convert(ndarray[int64_t] vals, object tz1, object tz2):
     else:
         utc_dates = vals
 
-    if _get_zone(tz2) == 'UTC':
+    if get_timezone(tz2) == 'UTC':
         return utc_dates
 
     result = np.zeros(n, dtype=np.int64)
-    if _is_tzlocal(tz2):
+    if is_tzlocal(tz2):
         for i in range(n):
             v = utc_dates[i]
             if v == NPY_NAT:
@@ -4139,7 +4107,7 @@ def tz_convert(ndarray[int64_t] vals, object tz1, object tz2):
                 pandas_datetime_to_datetimestruct(v, PANDAS_FR_ns, &dts)
                 dt = datetime(dts.year, dts.month, dts.day, dts.hour,
                               dts.min, dts.sec, dts.us, tz2)
-                delta = (int(_get_utcoffset(tz2, dt).total_seconds())
+                delta = (int(get_utcoffset(tz2, dt).total_seconds())
                              * 1000000000)
                 result[i] = v + delta
         return result
@@ -4174,7 +4142,7 @@ def tz_convert(ndarray[int64_t] vals, object tz1, object tz2):
     return result
 
 
-def tz_convert_single(int64_t val, object tz1, object tz2):
+cpdef int64_t tz_convert_single(int64_t val, object tz1, object tz2):
     """
     Convert the val (in i8) from timezone1 to timezone2
 
@@ -4202,13 +4170,13 @@ def tz_convert_single(int64_t val, object tz1, object tz2):
         return val
 
     # Convert to UTC
-    if _is_tzlocal(tz1):
+    if is_tzlocal(tz1):
         pandas_datetime_to_datetimestruct(val, PANDAS_FR_ns, &dts)
         dt = datetime(dts.year, dts.month, dts.day, dts.hour,
                       dts.min, dts.sec, dts.us, tz1)
-        delta = int(_get_utcoffset(tz1, dt).total_seconds()) * 1000000000
+        delta = int(get_utcoffset(tz1, dt).total_seconds()) * 1000000000
         utc_date = val - delta
-    elif _get_zone(tz1) != 'UTC':
+    elif get_timezone(tz1) != 'UTC':
         trans, deltas, typ = _get_dst_info(tz1)
         pos = trans.searchsorted(val, side='right') - 1
         if pos < 0:
@@ -4218,13 +4186,13 @@ def tz_convert_single(int64_t val, object tz1, object tz2):
     else:
         utc_date = val
 
-    if _get_zone(tz2) == 'UTC':
+    if get_timezone(tz2) == 'UTC':
         return utc_date
-    if _is_tzlocal(tz2):
+    if is_tzlocal(tz2):
         pandas_datetime_to_datetimestruct(val, PANDAS_FR_ns, &dts)
         dt = datetime(dts.year, dts.month, dts.day, dts.hour,
                       dts.min, dts.sec, dts.us, tz2)
-        delta = int(_get_utcoffset(tz2, dt).total_seconds()) * 1000000000
+        delta = int(get_utcoffset(tz2, dt).total_seconds()) * 1000000000
         return utc_date + delta
 
     # Convert UTC to other timezone
@@ -4236,141 +4204,6 @@ def tz_convert_single(int64_t val, object tz1, object tz2):
 
     offset = deltas[pos]
     return utc_date + offset
-
-# Timezone data caches, key is the pytz string or dateutil file name.
-dst_cache = {}
-
-
-def _p_tz_cache_key(tz):
-    """ Python interface for cache function to facilitate testing."""
-    return _tz_cache_key(tz)
-
-
-cdef inline object _tz_cache_key(object tz):
-    """
-    Return the key in the cache for the timezone info object or None
-    if unknown.
-
-    The key is currently the tz string for pytz timezones, the filename for
-    dateutil timezones.
-
-    Notes
-    =====
-    This cannot just be the hash of a timezone object. Unfortunately, the
-    hashes of two dateutil tz objects which represent the same timezone are
-    not equal (even though the tz objects will compare equal and represent
-    the same tz file). Also, pytz objects are not always hashable so we use
-    str(tz) instead.
-    """
-    if isinstance(tz, _pytz_BaseTzInfo):
-        return tz.zone
-    elif isinstance(tz, _dateutil_tzfile):
-        if '.tar.gz' in tz._filename:
-            raise ValueError('Bad tz filename. Dateutil on python 3 on '
-                             'windows has a bug which causes tzfile._filename '
-                             'to be the same for all timezone files. Please '
-                             'construct dateutil timezones implicitly by '
-                             'passing a string like "dateutil/Europe/London" '
-                             'when you construct your pandas objects instead '
-                             'of passing a timezone object. See '
-                             'https://github.com/pandas-dev/pandas/pull/7362')
-        return 'dateutil' + tz._filename
-    else:
-        return None
-
-
-cdef object _get_dst_info(object tz):
-    """
-    return a tuple of :
-      (UTC times of DST transitions,
-       UTC offsets in microseconds corresponding to DST transitions,
-       string of type of transitions)
-
-    """
-    cache_key = _tz_cache_key(tz)
-    if cache_key is None:
-        num = int(_get_utcoffset(tz, None).total_seconds()) * 1000000000
-        return (np.array([NPY_NAT + 1], dtype=np.int64),
-                np.array([num], dtype=np.int64),
-                None)
-
-    if cache_key not in dst_cache:
-        if _treat_tz_as_pytz(tz):
-            trans = np.array(tz._utc_transition_times, dtype='M8[ns]')
-            trans = trans.view('i8')
-            try:
-                if tz._utc_transition_times[0].year == 1:
-                    trans[0] = NPY_NAT + 1
-            except Exception:
-                pass
-            deltas = _unbox_utcoffsets(tz._transition_info)
-            typ = 'pytz'
-
-        elif _treat_tz_as_dateutil(tz):
-            if len(tz._trans_list):
-                # get utc trans times
-                trans_list = _get_utc_trans_times_from_dateutil_tz(tz)
-                trans = np.hstack([
-                    np.array([0], dtype='M8[s]'), # place holder for first item
-                    np.array(trans_list, dtype='M8[s]')]).astype(
-                    'M8[ns]')  # all trans listed
-                trans = trans.view('i8')
-                trans[0] = NPY_NAT + 1
-
-                # deltas
-                deltas = np.array([v.offset for v in (
-                    tz._ttinfo_before,) + tz._trans_idx], dtype='i8')
-                deltas *= 1000000000
-                typ = 'dateutil'
-
-            elif _is_fixed_offset(tz):
-                trans = np.array([NPY_NAT + 1], dtype=np.int64)
-                deltas = np.array([tz._ttinfo_std.offset],
-                                  dtype='i8') * 1000000000
-                typ = 'fixed'
-            else:
-                trans = np.array([], dtype='M8[ns]')
-                deltas = np.array([], dtype='i8')
-                typ = None
-
-        else:
-            # static tzinfo
-            trans = np.array([NPY_NAT + 1], dtype=np.int64)
-            num = int(_get_utcoffset(tz, None).total_seconds()) * 1000000000
-            deltas = np.array([num], dtype=np.int64)
-            typ = 'static'
-
-        dst_cache[cache_key] = (trans, deltas, typ)
-
-    return dst_cache[cache_key]
-
-cdef object _get_utc_trans_times_from_dateutil_tz(object tz):
-    """
-    Transition times in dateutil timezones are stored in local non-dst
-    time.  This code converts them to UTC. It's the reverse of the code
-    in dateutil.tz.tzfile.__init__.
-    """
-    new_trans = list(tz._trans_list)
-    last_std_offset = 0
-    for i, (trans, tti) in enumerate(zip(tz._trans_list, tz._trans_idx)):
-        if not tti.isdst:
-            last_std_offset = tti.offset
-        new_trans[i] = trans - last_std_offset
-    return new_trans
-
-
-cpdef ndarray _unbox_utcoffsets(object transinfo):
-    cdef:
-        Py_ssize_t i, sz
-        ndarray[int64_t] arr
-
-    sz = len(transinfo)
-    arr = np.empty(sz, dtype='i8')
-
-    for i in range(sz):
-        arr[i] = int(transinfo[i][0].total_seconds()) * 1000000000
-
-    return arr
 
 
 @cython.boundscheck(False)
@@ -4405,13 +4238,13 @@ def tz_localize_to_utc(ndarray[int64_t] vals, object tz, object ambiguous=None,
 
     result = np.empty(n, dtype=np.int64)
 
-    if _is_tzlocal(tz):
+    if is_tzlocal(tz):
         for i in range(n):
             v = vals[i]
             pandas_datetime_to_datetimestruct(v, PANDAS_FR_ns, &dts)
             dt = datetime(dts.year, dts.month, dts.day, dts.hour,
                           dts.min, dts.sec, dts.us, tz)
-            delta = int(_get_utcoffset(tz, dt).total_seconds()) * 1000000000
+            delta = int(get_utcoffset(tz, dt).total_seconds()) * 1000000000
             result[i] = v - delta
         return result
 
@@ -5116,7 +4949,7 @@ cdef _normalize_local(ndarray[int64_t] stamps, object tz):
         ndarray[int64_t] trans, deltas, pos
         pandas_datetimestruct dts
 
-    if _is_utc(tz):
+    if is_utc(tz):
         with nogil:
             for i in range(n):
                 if stamps[i] == NPY_NAT:
@@ -5125,7 +4958,7 @@ cdef _normalize_local(ndarray[int64_t] stamps, object tz):
                 pandas_datetime_to_datetimestruct(
                     stamps[i], PANDAS_FR_ns, &dts)
                 result[i] = _normalized_stamp(&dts)
-    elif _is_tzlocal(tz):
+    elif is_tzlocal(tz):
         for i in range(n):
             if stamps[i] == NPY_NAT:
                 result[i] = NPY_NAT
@@ -5133,7 +4966,7 @@ cdef _normalize_local(ndarray[int64_t] stamps, object tz):
             pandas_datetime_to_datetimestruct(stamps[i], PANDAS_FR_ns, &dts)
             dt = datetime(dts.year, dts.month, dts.day, dts.hour,
                           dts.min, dts.sec, dts.us, tz)
-            delta = int(_get_utcoffset(tz, dt).total_seconds()) * 1000000000
+            delta = int(get_utcoffset(tz, dt).total_seconds()) * 1000000000
             pandas_datetime_to_datetimestruct(stamps[i] + delta,
                                               PANDAS_FR_ns, &dts)
             result[i] = _normalized_stamp(&dts)
@@ -5178,14 +5011,15 @@ cdef inline int64_t _normalized_stamp(pandas_datetimestruct *dts) nogil:
 def dates_normalized(ndarray[int64_t] stamps, tz=None):
     cdef:
         Py_ssize_t i, n = len(stamps)
+        ndarray[int64_t] trans, deltas
         pandas_datetimestruct dts
 
-    if tz is None or _is_utc(tz):
+    if tz is None or is_utc(tz):
         for i in range(n):
             pandas_datetime_to_datetimestruct(stamps[i], PANDAS_FR_ns, &dts)
             if (dts.hour + dts.min + dts.sec + dts.us) > 0:
                 return False
-    elif _is_tzlocal(tz):
+    elif is_tzlocal(tz):
         for i in range(n):
             pandas_datetime_to_datetimestruct(stamps[i], PANDAS_FR_ns, &dts)
             dt = datetime(dts.year, dts.month, dts.day, dts.hour, dts.min,
