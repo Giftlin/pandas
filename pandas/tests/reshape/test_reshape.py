@@ -18,7 +18,6 @@ from pandas.compat import range, u
 
 
 class TestMelt(object):
-
     def setup_method(self, method):
         self.df = tm.makeTimeDataFrame()[:10]
         self.df['id1'] = (self.df['A'] > 0).astype(np.int64)
@@ -217,7 +216,6 @@ class TestMelt(object):
 
 
 class TestGetDummies(object):
-
     sparse = False
 
     def setup_method(self, method):
@@ -543,7 +541,7 @@ class TestGetDummies(object):
                             nan: {0: 0,
                                   1: 0,
                                   2: 1}}, dtype=np.uint8).reindex_axis(
-                                      ['b', nan], 1)
+            ['b', nan], 1)
         assert_frame_equal(res_na, exp_na)
 
         res_just_na = get_dummies([nan], dummy_na=True, sparse=self.sparse,
@@ -639,6 +637,35 @@ class TestGetDummies(object):
 
             tm.assert_frame_equal(result, expected)
 
+    def test_dataframe_dummies_reindex_false(self):
+        df = pd.DataFrame({'A': ["X", "Y", "Z"],
+                           'B': [1, 2, 3],
+                           'C': ["A", "B", "C"]},
+                          dtype=np.uint8)
+        columns = ['A_X', 'A_Y', 'A_Z', 'B', 'C_A', 'C_B', 'C_C']
+        expected = DataFrame([
+            [1, 0, 0, 1, 1, 0, 0],
+            [0, 1, 0, 2, 0, 1, 0],
+            [0, 0, 1, 3, 0, 0, 1]
+        ], columns=columns, dtype=np.uint8)
+        result = get_dummies(df, sparse=self.sparse, reindex=False)
+        tm.assert_frame_equal(result, expected)
+
+    def test_dataframe_dummies_reindex_default(self):
+        df = pd.DataFrame({'A': ["X", "Y", "Z"],
+                           'B': [1, 2, 3],
+                           'C': ["A", "B", "C"]},
+                          dtype=np.uint8)
+        columns = ['B', 'A_X', 'A_Y', 'A_Z', 'C_A', 'C_B', 'C_C']
+        expected = DataFrame([
+            [1, 1, 0, 0, 1, 0, 0],
+            [2, 0, 1, 0, 0, 1, 0],
+            [3, 0, 0, 1, 0, 0, 1]
+        ], columns=columns,
+            dtype=np.uint8)
+        result = get_dummies(df, sparse=self.sparse)
+        tm.assert_frame_equal(result, expected)
+
 
 class TestGetDummiesSparse(TestGetDummies):
     sparse = True
@@ -649,7 +676,6 @@ class TestGetDummiesSparse(TestGetDummies):
 
 
 class TestMakeAxisDummies(object):
-
     def test_preserve_categorical_dtype(self):
         # GH13854
         for ordered in [False, True]:
@@ -670,7 +696,6 @@ class TestMakeAxisDummies(object):
 
 
 class TestLreshape(object):
-
     def test_pairs(self):
         data = {'birthdt': ['08jan2009', '20dec2008', '30dec2008', '21dec2008',
                             '11jan2009'],
@@ -680,7 +705,7 @@ class TestLreshape(object):
                 'visitdt1': ['11jan2009', '22dec2008', '04jan2009',
                              '29dec2008', '20jan2009'],
                 'visitdt2':
-                ['21jan2009', nan, '22jan2009', '31dec2008', '03feb2009'],
+                    ['21jan2009', nan, '22jan2009', '31dec2008', '03feb2009'],
                 'visitdt3': ['05feb2009', nan, nan, '02jan2009', '15feb2009'],
                 'wt1': [1823, 3338, 1549, 3298, 4306],
                 'wt2': [2011.0, nan, 1892.0, 3338.0, 4575.0],
@@ -693,9 +718,9 @@ class TestLreshape(object):
         result = lreshape(df, spec)
 
         exp_data = {'birthdt':
-                    ['08jan2009', '20dec2008', '30dec2008', '21dec2008',
-                     '11jan2009', '08jan2009', '30dec2008', '21dec2008',
-                     '11jan2009', '08jan2009', '21dec2008', '11jan2009'],
+                        ['08jan2009', '20dec2008', '30dec2008', '21dec2008',
+                         '11jan2009', '08jan2009', '30dec2008', '21dec2008',
+                         '11jan2009', '08jan2009', '21dec2008', '11jan2009'],
                     'birthwt': [1766, 3301, 1454, 3139, 4133, 1766, 1454, 3139,
                                 4133, 1766, 3139, 4133],
                     'id': [101, 102, 103, 104, 105, 101, 103, 104, 105, 101,
@@ -714,10 +739,10 @@ class TestLreshape(object):
 
         result = lreshape(df, spec, dropna=False)
         exp_data = {'birthdt':
-                    ['08jan2009', '20dec2008', '30dec2008', '21dec2008',
-                     '11jan2009', '08jan2009', '20dec2008', '30dec2008',
-                     '21dec2008', '11jan2009', '08jan2009', '20dec2008',
-                     '30dec2008', '21dec2008', '11jan2009'],
+                        ['08jan2009', '20dec2008', '30dec2008', '21dec2008',
+                         '11jan2009', '08jan2009', '20dec2008', '30dec2008',
+                         '21dec2008', '11jan2009', '08jan2009', '20dec2008',
+                         '30dec2008', '21dec2008', '11jan2009'],
                     'birthwt': [1766, 3301, 1454, 3139, 4133, 1766, 3301, 1454,
                                 3139, 4133, 1766, 3301, 1454, 3139, 4133],
                     'id': [101, 102, 103, 104, 105, 101, 102, 103, 104, 105,
@@ -742,7 +767,6 @@ class TestLreshape(object):
 
 
 class TestWideToLong(object):
-
     def test_simple(self):
         np.random.seed(123)
         x = np.random.randn(3)
